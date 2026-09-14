@@ -1,17 +1,17 @@
-# rust-template
+# python-template
 
-Full-stack auth template: **Next.js → Rust API → PostgreSQL**. The browser only
-ever talks to Next.js; the Rust API is proxied server-side and never exposed
-directly.
+Full-stack auth template: **Next.js → FastAPI → PostgreSQL**. The browser only
+ever talks to Next.js; the FastAPI backend is proxied server-side and never
+exposed directly.
 
 ```
 Browser
    ↓
-Next.js        frontend/  → :3000   React UI, routing, SSR/static gen, server components
+Next.js        frontend/    → :3000   React UI, routing, SSR/static gen, server components
    ↓
-Rust API       backend/   → :8080   axum + sqlx + JWT + scrypt + email worker
+FastAPI        backend/     → :8080   SQLAlchemy + JWT + scrypt + email worker
    ↓
-PostgreSQL     migrations apply on boot
+PostgreSQL     tables created on boot
 ```
 
 ## Quick Start
@@ -20,38 +20,39 @@ PostgreSQL     migrations apply on boot
 ./manage.sh       # → [7] First-Time Setup, then → [1] Start All
 ```
 
-Needs Rust (stable, via rustup), Node 20+, and a running PostgreSQL (option 1
-refuses to start if it's down). Dev admin: **admin@mail.com** /
-**Password1234!** — first login from a new browser asks for a 2FA code; in
-development it's always `1234`, and the browser is trusted afterwards.
+Needs Python 3.11+ (manage.sh finds one, or set `PYTHON`), Node 20+, and a
+running PostgreSQL (option 1 refuses to start if it's down). Dev admin:
+**admin@mail.com** / **Password1234!** — first login from a new browser asks for
+a 2FA code; in development it's always `1234`, and the browser is trusted
+afterwards.
 
 Useful menu options beyond setup/start: [5] status, [6] tests, [9] reset DB,
 [10] tail logs, [11] re-seed (drop DB + restart backend).
 
 ## Docs
 
+- **[backend/README.md](backend/README.md)** — the backend, its layout, config, and endpoints
 - **[docs/FEATURE.md](docs/FEATURE.md)** — what this build does
 - **[docs/DATABASE.md](docs/DATABASE.md)** — install Postgres, schema, reset, tests
-- **[docs/RUST_MIGRATION.md](docs/RUST_MIGRATION.md)** — how the backend moved from Go to Rust
-- **`.env.example`** — every config variable
 
 ## Tests
 
-`./manage.sh` → 6 runs backend tests + frontend build. Backend integration
-tests need `TEST_DATABASE_URL` (see docs/DATABASE.md).
+`./manage.sh` → 6 runs backend pytest + frontend build. Backend integration
+tests need `TEST_DATABASE_URL` (see docs/DATABASE.md); without it they skip and
+the unit tests still run.
 
 ## Roles
 
 `client` < `staff` < `admin`. Grant via CLI only (no self-service promotion):
 
 ```bash
-cd backend && cargo run -- set-role you@email.com admin
+cd backend && .venv/bin/python -m app.cli set-role you@email.com admin
 # or: ./manage.sh → [8]
 ```
 
 ## API
 
-19 endpoints under `/api/*` — see `backend/src/routes.rs` (`new_router()`):
+19 endpoints under `/api/*` — see `backend/app/api/`:
 
 - **Public auth** (8): signup, verify, resend-verification, forgot-password,
   reset-password, login, login/verify (2FA code), login/resend (2FA code)

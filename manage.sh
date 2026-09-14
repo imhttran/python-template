@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Single entry point for the template: start/stop/status, tests, setup,
 # role management, database reset.
-# Backend: Rust + axum + PostgreSQL (backend/). Frontend: Next.js (frontend/).
+# Backend: FastAPI + SQLAlchemy + PostgreSQL (backend/). Frontend: Next.js (frontend/).
 
 set -u
 
@@ -13,14 +13,30 @@ GREEN='\033[32m'; YELLOW='\033[33m'; RED='\033[31m'; NC='\033[0m'
 PORT_BACKEND=8080
 PORT_FRONTEND=3000
 
-# Seconds to wait for each service's port. Cargo may need to compile before
-# the backend's port opens (cold target/), so it gets a generous window;
-# npm run dev is quick.
-BACKEND_START_TRIES=120
+# Seconds to wait for each service's port. Uvicorn binds quickly once the
+# virtualenv exists; npm run dev is quick too.
+BACKEND_START_TRIES=30
 FRONTEND_START_TRIES=20
 
-# Service logs land at $LOG_BASE-<dir>.log.
-LOG_BASE=/tmp/rust-template
+# Service logs land at $LOG_BASE-<slug>.log.
+LOG_BASE=/tmp/python-template
+
+# ---- python ----
+
+# Pick a Python 3.11+ interpreter. Override with PYTHON=... if the default
+# search order doesn't find yours.
+find_python() {
+  if [ -n "${PYTHON:-}" ]; then echo "$PYTHON"; return; fi
+  local candidate
+  for candidate in python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+        echo "$candidate"; return
+      fi
+    fi
+  done
+  echo ""
+}
 
 # ---- database ----
 
@@ -28,7 +44,7 @@ LOG_BASE=/tmp/rust-template
 # precedence the backend's env loader applies. Used by the Postgres check,
 # database reset, and re-seed commands.
 load_db_url() {
-  local url="postgres://postgres:postgres@localhost:5432/rust_template?sslmode=disable"
+  local url="postgres://postgres:postgres@localhost:5432/db_template?sslmode=disable"
   if [ -f "$ROOT_DIR/.env" ]; then
     url=$(grep -E '^DATABASE_URL=' "$ROOT_DIR/.env" | tail -1 | cut -d= -f2- | tr -d '"' || true)
   fi
@@ -52,22 +68,22 @@ wait_for_port() {
   done
 }
 
-# start_service <Name> <dir> <port> <tries> <cmd...> — checks the port is
+# start_service <Name> <dir> <slug> <port> <tries> <cmd...> — checks the port is
 # free, backgrounds <cmd> in <dir>, waits for the port, writes the PID to
-# <dir>/<dir>.pid.
+# <dir>/<slug>.pid.
 start_service() {
-  local name="$1" dir="$2" port="$3" tries="$4"; shift 4
+  local name="$1" dir="$2" slug="$3" port="$4" tries="$5"; shift 5
   if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
     echo -e "${YELLOW}$name already running on :$port${NC}"
     return 0
   fi
   echo "Starting $name on :$port ..."
-  (cd "$ROOT_DIR/$dir" && "$@" > "$LOG_BASE-$dir.log" 2>&1 &)
+  (cd "$ROOT_DIR/$dir" && "$@" > "$LOG_BASE-$slug.log" 2>&1 &)
   wait_for_port "$port" "$name" "$tries" || return 1
-  # PID of the actual listening process (cargo run's child binary / next dev).
+  # PID of the actual listening process (uvicorn / next dev).
   local pid
   pid=$(lsof -nP -tiTCP:"$port" -sTCP:LISTEN | head -1)
-  if [ -n "$pid" ]; then echo "$pid" > "$ROOT_DIR/$dir/$dir.pid"; fi
+  if [ -n "$pid" ]; then echo "$pid" > "$ROOT_DIR/$dir/$slug.pid"; fi
 }
 
 start_backend() {
@@ -80,17 +96,20 @@ start_backend() {
     echo "Start it first, e.g. brew services start postgresql@16"
     return 1
   fi
-  if ! start_service "Backend" backend "$PORT_BACKEND" "$BACKEND_START_TRIES" cargo run; then
+  if [ ! -x "$ROOT_DIR/backend/.venv/bin/python" ]; then
+    echo -e "${RED}backend/.venv is missing. Run [7] First-Time Setup first.${NC}"
+    return 1
+  fi
+  if ! start_service "Backend" backend backend "$PORT_BACKEND" "$BACKEND_START_TRIES" \
+      env PORT="$PORT_BACKEND" .venv/bin/python -m app.main; then
     echo "→ see $LOG_BASE-backend.log"
     return 1
   fi
 }
 
 stop_service() {
-  local dir="$1" name="$2" port="$3"
-  # Separate statement: in one `local` line every RHS is expanded before any
-  # assignment happens, so $dir above would still be unbound here (set -u).
-  local pid_file="$ROOT_DIR/$dir/$dir.pid"
+  local name="$1" dir="$2" slug="$3" port="$4"
+  local pid_file="$ROOT_DIR/$dir/$slug.pid"
   local pid=""
   if [ -f "$pid_file" ]; then
     pid=$(cat "$pid_file")
@@ -110,14 +129,14 @@ stop_service() {
 
 start_all() {
   start_backend || return 1
-  start_service "Frontend" frontend "$PORT_FRONTEND" "$FRONTEND_START_TRIES" npm run dev
+  start_service "Frontend" frontend frontend "$PORT_FRONTEND" "$FRONTEND_START_TRIES" npm run dev
   echo -e "${GREEN}Backend: http://localhost:$PORT_BACKEND  Frontend: http://localhost:$PORT_FRONTEND${NC}"
   echo "Logs: $LOG_BASE-backend.log, $LOG_BASE-frontend.log"
 }
 
 stop_all() {
-  stop_service backend Backend "$PORT_BACKEND"
-  stop_service frontend Frontend "$PORT_FRONTEND"
+  stop_service "Backend" backend backend "$PORT_BACKEND"
+  stop_service "Frontend" frontend frontend "$PORT_FRONTEND"
 }
 
 show_status() {
@@ -138,28 +157,39 @@ show_status() {
 first_time_setup() {
   echo "→ frontend: npm install"
   (cd "$ROOT_DIR/frontend" && npm install) || return 1
-  echo "→ backend: cargo build (compiles dependencies, may take a few minutes)"
-  (cd "$ROOT_DIR/backend" && cargo build) || return 1
-  echo "→ database: migrations apply automatically on backend start."
-  echo "  Requires a running PostgreSQL (see DATABASE_URL in .env.example)."
+  local py
+  py=$(find_python)
+  if [ -z "$py" ]; then
+    echo -e "${RED}No Python 3.11+ found. Install one, or set PYTHON=/path/to/python3.${NC}"
+    return 1
+  fi
+  echo "→ backend: $py -m venv .venv + pip install"
+  if [ ! -x "$ROOT_DIR/backend/.venv/bin/python" ]; then
+    (cd "$ROOT_DIR/backend" && "$py" -m venv .venv) || return 1
+  fi
+  (cd "$ROOT_DIR/backend" && .venv/bin/pip install -e ".[dev]") || return 1
+  echo "→ database: tables apply automatically on backend start."
+  echo "  Requires a running PostgreSQL (see DATABASE_URL in backend/README.md)."
   echo -e "${GREEN}Setup complete. Start everything with option 1.${NC}"
 }
 
-# Backend tests (cargo test) + frontend build. Integration tests need
+# Backend tests (pytest) + frontend build. Integration tests need
 # TEST_DATABASE_URL; without it they skip and the unit tests still run.
 run_tests() {
   if [ -n "${TEST_DATABASE_URL:-}" ]; then
-    (cd "$ROOT_DIR/backend" && TEST_DATABASE_URL="$TEST_DATABASE_URL" cargo test) || return 1
+    (cd "$ROOT_DIR/backend" && TEST_DATABASE_URL="$TEST_DATABASE_URL" .venv/bin/pytest) || return 1
   else
     echo -e "${YELLOW}TEST_DATABASE_URL not set — unit-only tests (integration tests skip).${NC}"
-    (cd "$ROOT_DIR/backend" && cargo test) || return 1
+    (cd "$ROOT_DIR/backend" && .venv/bin/pytest) || return 1
   fi
 }
 
 set_user_role() {
   read -r -p "Email: " email
   read -r -p "Role (client/staff/admin): " role
-  (cd "$ROOT_DIR/backend" && cargo run -- set-role "$email" "$role") || return 1
+  local url
+  url=$(load_db_url)
+  (cd "$ROOT_DIR/backend" && DATABASE_URL="$url" .venv/bin/python -m app.cli set-role "$email" "$role") || return 1
 }
 
 reset_database() {
@@ -172,8 +202,8 @@ reset_database() {
   echo -e "${GREEN}Database reset. Tables re-apply on next backend start.${NC}"
 }
 
-# Drop the schema, then restart the backend so it re-migrates and re-seeds
-# (dev admin). One-shot "start fresh".
+# Drop the schema, then restart the backend so it re-creates tables and
+# re-seeds (dev admin). One-shot "start fresh".
 re_seed() {
   local url
   url=$(load_db_url)
@@ -181,7 +211,7 @@ re_seed() {
   read -r -p "Type 'yes' to confirm: " confirm
   if [ "$confirm" != "yes" ]; then echo "Aborted."; return 0; fi
   psql "$url" -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;' || return 1
-  stop_service backend Backend "$PORT_BACKEND"
+  stop_service "Backend" backend backend "$PORT_BACKEND"
   start_backend || return 1
   echo -e "${GREEN}Database re-seeded.${NC}"
 }
@@ -205,13 +235,13 @@ view_logs() {
 
 while true; do
   echo ""
-  echo "==== Rust + Next.js template ===="
+  echo "==== Python + Next.js template ===="
   echo " 1) Start All (Backend + Frontend)"
   echo " 2) Start Backend only"
   echo " 3) Start Frontend only"
   echo " 4) Stop All"
   echo " 5) Status"
-  echo " 6) Run Tests (backend cargo test + frontend build)"
+  echo " 6) Run Tests (backend pytest + frontend build)"
   echo " 7) First-Time Setup (install deps)"
   echo " 8) Set User Role"
   echo " 9) Reset Database (destructive)"
@@ -222,7 +252,7 @@ while true; do
   case "$choice" in
     1) start_all ;;
     2) start_backend ;;
-    3) start_service "Frontend" frontend "$PORT_FRONTEND" "$FRONTEND_START_TRIES" npm run dev ;;
+    3) start_service "Frontend" frontend frontend "$PORT_FRONTEND" "$FRONTEND_START_TRIES" npm run dev ;;
     4) stop_all ;;
     5) show_status ;;
     6)

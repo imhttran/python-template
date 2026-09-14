@@ -3,8 +3,16 @@ node_modules/
 .next/
 tsconfig.tsbuildinfo
 
-# Rust (backend/)
-target/
+# Python (backend/)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # Service pid files (manage.sh)
 *.pid
